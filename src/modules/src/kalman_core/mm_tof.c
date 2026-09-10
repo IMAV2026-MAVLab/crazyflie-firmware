@@ -24,6 +24,21 @@
  */
 
 #include "mm_tof.h"
+#include "param.h"
+#include "log.h"
+
+// ---- Innovation gate for the down-range (ToF) update ----
+// Rejects brief, physically-impossible jumps in the ToF reading (e.g. an obstacle
+// or ledge passing under the drone) so the EKF's z COASTS on the accelerometer
+// prediction through the glitch instead of lurching. Because z stays ~correct
+// during the glitch, the reading also recovers smoothly on the far edge (small
+// innovation) -> no jump AND no drop. A change that PERSISTS past tofGateHold
+// samples is treated as a real terrain step and accepted. Set tofGate=0 to disable.
+static float    tofGate     = 0.20f;  // [m] reject |measured-predicted| above this (0 = off)
+static uint16_t tofGateHold = 8;      // accept after this many consecutive rejects (~real step)
+static uint16_t tofRejects  = 0;      // running count of consecutive rejects
+static uint8_t  tofGated    = 0;      // 1 = last ToF update was rejected (for logging)
+static float    tofInnov    = 0.0f;   // last innovation [m] (for tuning tofGate)
 
 void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
 {
@@ -55,7 +70,47 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
 
     h[KC_STATE_Z] = 1 / cosf(angle); // This just acts like a gain for the sensor model. Further updates are done in the scalar update function below
 
-    // Scalar update
-    kalmanCoreScalarUpdate(this, &H, measuredDistance-predictedDistance, tof->stdDev);
+    // Innovation gate: reject a brief implausible jump (obstacle glitch), but
+    // accept a change that persists (real terrain step). See note at top.
+    float innovation = measuredDistance - predictedDistance;
+    tofInnov = innovation;
+    if (tofGate > 0.0001f && fabsf(innovation) > tofGate && tofRejects < tofGateHold) {
+      tofRejects++;    // glitch -> skip fusion; z coasts on the accel prediction
+      tofGated = 1;
+    } else {
+      tofRejects = 0;  // plausible, or a persisted real change -> accept & re-converge
+      tofGated = 0;
+      kalmanCoreScalarUpdate(this, &H, innovation, tof->stdDev);
+    }
   }
 }
+
+/**
+ * Down-range (ToF) innovation gate — rejects obstacle-induced height glitches
+ * before they reach the EKF. Set n6/height glitches vanish without a lurch.
+ */
+PARAM_GROUP_START(tofGate)
+/**
+ * @brief Reject ToF updates whose |measured-predicted| exceeds this [m]. 0 = off. (default 0.20)
+ */
+PARAM_ADD(PARAM_FLOAT, gate, &tofGate)
+/**
+ * @brief Accept a gated change after this many consecutive rejects (real terrain step). (default 8)
+ */
+PARAM_ADD(PARAM_UINT16, hold, &tofGateHold)
+PARAM_GROUP_STOP(tofGate)
+
+LOG_GROUP_START(tofGate)
+/**
+ * @brief 1 = the most recent ToF update was rejected by the gate
+ */
+LOG_ADD(LOG_UINT8, gated, &tofGated)
+/**
+ * @brief Most recent ToF innovation (measured - predicted) [m]
+ */
+LOG_ADD(LOG_FLOAT, innov, &tofInnov)
+/**
+ * @brief Consecutive rejects (climbs to tofGate.hold then forces accept)
+ */
+LOG_ADD(LOG_UINT16, rej, &tofRejects)
+LOG_GROUP_STOP(tofGate)
