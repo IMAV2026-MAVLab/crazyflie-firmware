@@ -34,8 +34,18 @@
 // during the glitch, the reading also recovers smoothly on the far edge (small
 // innovation) -> no jump AND no drop. A change that PERSISTS past tofGateHold
 // samples is treated as a real terrain step and accepted. Set tofGate=0 to disable.
-static float    tofGate     = 0.20f;  // [m] reject |measured-predicted| above this (0 = off)
-static uint16_t tofGateHold = 8;      // accept after this many consecutive rejects (~real step)
+// 2026-09-10 (flight 19:55): gating against the EKF's own prediction let a sill CREEP in -- the ToF cone
+// blends sill and floor on the way in, so the reading ramps down in steps below the gate, each accepted
+// one drags z along, and once z is wrong the true floor is rejected for the whole hold. The reference is
+// therefore the LAST ACCEPTED reading, with an allowance that grows at a physical vertical speed:
+//   |measured - lastAccepted| > gate + rate * (time since the last accept)  -> reject (up to hold)
+// A ramp is rejected (a real descent never moves 0.15 m in 25 ms), and the floor is accepted the instant
+// it is back, since it matches the reference.
+static float    tofGate     = 0.10f;  // [m] base allowance vs the last accepted reading (0 = off)
+static float    tofRate     = 0.30f;  // [m/s] the allowance grows at this rate while rejecting
+static uint16_t tofGateHold = 40;     // accept after this many consecutive rejects (~real step; 40 = 1 s)
+static float    tofRef      = -1.0f;  // last accepted reading [m]
+static uint32_t tofRefMs    = 0;      // ...and when
 static uint16_t tofRejects  = 0;      // running count of consecutive rejects
 static uint8_t  tofGated    = 0;      // 1 = last ToF update was rejected (for logging)
 static float    tofInnov    = 0.0f;   // last innovation [m] (for tuning tofGate)
@@ -74,12 +84,16 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
     // accept a change that persists (real terrain step). See note at top.
     float innovation = measuredDistance - predictedDistance;
     tofInnov = innovation;
-    if (tofGate > 0.0001f && fabsf(innovation) > tofGate && tofRejects < tofGateHold) {
+    uint32_t now = tof->timestamp;                       // ticks = ms
+    if (tofRef < 0.0f) { tofRef = measuredDistance; tofRefMs = now; }
+    float allowed = tofGate + tofRate * (float)(now - tofRefMs) * 0.001f;
+    if (tofGate > 0.0001f && fabsf(measuredDistance - tofRef) > allowed && tofRejects < tofGateHold) {
       tofRejects++;    // glitch -> skip fusion; z coasts on the accel prediction
       tofGated = 1;
     } else {
       tofRejects = 0;  // plausible, or a persisted real change -> accept & re-converge
       tofGated = 0;
+      tofRef = measuredDistance; tofRefMs = now;
       kalmanCoreScalarUpdate(this, &H, innovation, tof->stdDev);
     }
   }
@@ -91,11 +105,15 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
  */
 PARAM_GROUP_START(tofGate)
 /**
- * @brief Reject ToF updates whose |measured-predicted| exceeds this [m]. 0 = off. (default 0.20)
+ * @brief Base allowance [m] vs the LAST ACCEPTED reading. 0 = off. (default 0.10)
  */
 PARAM_ADD(PARAM_FLOAT, gate, &tofGate)
 /**
- * @brief Accept a gated change after this many consecutive rejects (real terrain step). (default 8)
+ * @brief The allowance grows at this vertical rate [m/s] while rejecting. (default 0.30)
+ */
+PARAM_ADD(PARAM_FLOAT, rate, &tofRate)
+/**
+ * @brief Accept a gated change after this many consecutive rejects (real terrain step). (default 40 = 1 s)
  */
 PARAM_ADD(PARAM_UINT16, hold, &tofGateHold)
 PARAM_GROUP_STOP(tofGate)
@@ -113,4 +131,8 @@ LOG_ADD(LOG_FLOAT, innov, &tofInnov)
  * @brief Consecutive rejects (climbs to tofGate.hold then forces accept)
  */
 LOG_ADD(LOG_UINT16, rej, &tofRejects)
+/**
+ * @brief The reference: last accepted ToF reading [m]
+ */
+LOG_ADD(LOG_FLOAT, ref, &tofRef)
 LOG_GROUP_STOP(tofGate)
