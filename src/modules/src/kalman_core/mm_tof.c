@@ -45,6 +45,7 @@ static float    tofGate     = 0.10f;  // [m] base allowance vs the last accepted
 static float    tofRate     = 0.30f;  // [m/s] the allowance grows at this rate while rejecting
 static uint16_t tofGateHold = 40;     // accept after this many consecutive rejects (~real step; 40 = 1 s)
 static float    tofRef      = -1.0f;  // last accepted reading [m]
+static float    tofPinStd   = 2.0f;   // while rejecting, pin z to tofRef with this x the reading's stdDev (0 = coast)
 static uint32_t tofRefMs    = 0;      // ...and when
 static uint16_t tofRejects  = 0;      // running count of consecutive rejects
 static uint8_t  tofGated    = 0;      // 1 = last ToF update was rejected (for logging)
@@ -88,8 +89,13 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
     if (tofRef < 0.0f) { tofRef = measuredDistance; tofRefMs = now; }
     float allowed = tofGate + tofRate * (float)(now - tofRefMs) * 0.001f;
     if (tofGate > 0.0001f && fabsf(measuredDistance - tofRef) > allowed && tofRejects < tofGateHold) {
-      tofRejects++;    // glitch -> skip fusion; z coasts on the accel prediction
+      tofRejects++;
       tofGated = 1;
+      // Glitch: instead of letting z COAST (flight 2026-09-10 20:05: a blended edge sample inside the
+      // allowance had kicked vz, the coasting z then ran away and the height hold climbed 0.6-1.5 m),
+      // pin the filter to the last good reading: the drone is not commanded in z while crossing an
+      // obstacle, so 'height unchanged' is the truthful measurement. Softer than a real reading.
+      if (tofPinStd > 0.0f) kalmanCoreScalarUpdate(this, &H, tofRef - predictedDistance, tof->stdDev * tofPinStd);
     } else {
       tofRejects = 0;  // plausible, or a persisted real change -> accept & re-converge
       tofGated = 0;
@@ -112,6 +118,10 @@ PARAM_ADD(PARAM_FLOAT, gate, &tofGate)
  * @brief The allowance grows at this vertical rate [m/s] while rejecting. (default 0.30)
  */
 PARAM_ADD(PARAM_FLOAT, rate, &tofRate)
+/**
+ * @brief While rejecting, pin z to the last accepted reading with this x its stdDev; 0 = let z coast. (default 2.0)
+ */
+PARAM_ADD(PARAM_FLOAT, pin, &tofPinStd)
 /**
  * @brief Accept a gated change after this many consecutive rejects (real terrain step). (default 40 = 1 s)
  */
