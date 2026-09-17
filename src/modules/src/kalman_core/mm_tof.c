@@ -44,6 +44,10 @@
 static float    tofGate     = 0.10f;  // [m] base allowance vs the last accepted reading (0 = off)
 static float    tofRate     = 0.30f;  // [m/s] the allowance grows at this rate while rejecting
 static uint16_t tofGateHold = 40;     // accept after this many consecutive rejects (~real step; 40 = 1 s)
+static float    tofStab     = 0.05f;  // [m] a reading must also be within this of the PREVIOUS raw sample (a blend ramp is not)
+static uint16_t tofGateHoldDn = 200;  // give-up for a CLOSER reading (obstacle under the drone): 5 s, vs tofGateHold for farther
+static uint8_t  tofFlowSkip = 1;      // 1 = the flow update is skipped while this gate rejects (same obstacle in the flow camera)
+static float    tofPrev     = -1.0f;  // previous raw reading [m]
 static float    tofRef      = -1.0f;  // last accepted reading [m]
 static float    tofPinStd   = 2.0f;   // while rejecting, pin z to tofRef with this x the reading's stdDev (0 = coast)
 static uint32_t tofRefMs    = 0;      // ...and when
@@ -86,9 +90,17 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
     float innovation = measuredDistance - predictedDistance;
     tofInnov = innovation;
     uint32_t now = tof->timestamp;                       // ticks = ms
-    if (tofRef < 0.0f) { tofRef = measuredDistance; tofRefMs = now; }
+    if (measuredDistance < 0.02f) { return; }            // no target / saturated: neither accept nor count
+    if (tofRef < 0.0f) { tofRef = measuredDistance; tofRefMs = now; tofPrev = measuredDistance; }
     float allowed = tofGate + tofRate * (float)(now - tofRefMs) * 0.001f;
-    if (tofGate > 0.0001f && fabsf(measuredDistance - tofRef) > allowed && tofRejects < tofGateHold) {
+    // 2026-09-16 21:43: a trailing-edge blend (2.24 m between a 0.68 m bar and the 2.6 m floor) slipped inside the
+    // time-grown allowance, pulled the reference down, the true floor was then rejected and pinned, the drone climbed
+    // into the ceiling. Blends are transitional: they differ from the previous raw sample by 0.1-1 m, real motion by
+    // < 15 mm per sample. So a reading must ALSO be stable vs the previous sample to be accepted.
+    bool stable = fabsf(measuredDistance - tofPrev) < tofStab;
+    tofPrev = measuredDistance;
+    uint16_t hold = (measuredDistance < tofRef) ? tofGateHoldDn : tofGateHold;   // closer = obstacle: be patient
+    if (tofGate > 0.0001f && (fabsf(measuredDistance - tofRef) > allowed || !stable) && tofRejects < hold) {
       tofRejects++;
       tofGated = 1;
       // Glitch: instead of letting z COAST (flight 2026-09-10 20:05: a blended edge sample inside the
@@ -126,6 +138,18 @@ PARAM_ADD(PARAM_FLOAT, pin, &tofPinStd)
  * @brief Accept a gated change after this many consecutive rejects (real terrain step). (default 40 = 1 s)
  */
 PARAM_ADD(PARAM_UINT16, hold, &tofGateHold)
+/**
+ * @brief Give-up for a reading CLOSER than the reference (obstacle under the drone), in samples. (default 200 = 5 s)
+ */
+PARAM_ADD(PARAM_UINT16, holdDn, &tofGateHoldDn)
+/**
+ * @brief A reading must be within this [m] of the previous raw sample to be accepted (rejects blend ramps). (default 0.05)
+ */
+PARAM_ADD(PARAM_FLOAT, stab, &tofStab)
+/**
+ * @brief 1 = skip the optical-flow update while the ToF gate rejects (the flow camera sees the same obstacle). (default 1)
+ */
+PARAM_ADD(PARAM_UINT8, flowSkip, &tofFlowSkip)
 PARAM_GROUP_STOP(tofGate)
 
 LOG_GROUP_START(tofGate)
@@ -146,3 +170,5 @@ LOG_ADD(LOG_UINT16, rej, &tofRejects)
  */
 LOG_ADD(LOG_FLOAT, ref, &tofRef)
 LOG_GROUP_STOP(tofGate)
+
+bool kalmanTofGateRejecting(void) { return tofFlowSkip && tofGated; }

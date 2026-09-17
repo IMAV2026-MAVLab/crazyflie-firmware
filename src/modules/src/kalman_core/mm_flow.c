@@ -38,8 +38,14 @@ static float measuredNY;
 
 static Axis3f flowdeckPos = { .axis = { FLOWDECK_POS_X, FLOWDECK_POS_Y, FLOWDECK_POS_Z } }; // In body coordinate system
 
+#include "mm_tof.h"
+
 void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *flow, const Axis3f *gyro)
 {
+  // While the range gate rejects, the flow camera is looking at the same obstacle (a bar 0.3-0.6 m below at 2.5 m):
+  // its motion scaled by the filter's z gave +-0.4 m position jumps and 20-80 deg yaw kicks (2026-09-10 20:19, 20:41,
+  // 21:39). Coasting on the IMU for the rejected streak costs a few cm.
+  if (kalmanTofGateRejecting()) { return; }
   // Inclusion of flow measurements in the EKF done by two scalar updates
 
   // ~~~ Camera constants ~~~
